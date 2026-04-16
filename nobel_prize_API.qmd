@@ -1,0 +1,12 @@
+---
+title: "Nobel_Prize_API"
+author: "Jess Chen"
+format: html
+editor: visual
+---
+
+## Approach
+
+1.  Use Nobel Prize API to get data in JSON
+2.  load and tidy data
+3.  Create 4 questions and do analysis to provide answer
