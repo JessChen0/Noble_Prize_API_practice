@@ -1,12 +1,285 @@
 ---
 title: "Nobel_Prize_API"
-author: "Jess Chen"
-format: html
-editor: visual
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    theme: cosmo
+    code-fold: true
+    self-contained: true
+execute:
+  warning: false
+  message: false
 ---
 
-## Approach
+## Introduction
 
-1.  Use Nobel Prize API to get data in JSON
-2.  load and tidy data
-3.  Create 4 questions and do analysis to provide answer
+In this project, I used Claude LLM to pull and analyze data from Nobel Prize APIs. While I give Claude most of the credit for the code, I created the type of analysis and collabroated on issue identification and resolution. I also discovered a neat formatting trick to incorporate code into the rendering if a beautiful way with extenders!
+
+Claude's code recommended pulling out setup separately, which after doing coding myself, I see the benefit in having all libraries called up in one place.
+
+## Setup
+
+```{r}
+#| label: setup
+
+library(httr2)
+library(jsonlite)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(purrr)
+library(stringr)
+library(lubridate)
+
+theme_set(theme_minimal(base_size = 13))
+current_year <- as.integer(format(Sys.Date(), "%Y"))
+```
+
+## Fetch Data from Nobel Prize API
+
+We fetch prize-level data from `/nobelPrizes` and full laureate details (including birth country) from `/laureates`, then join them together.
+
+```{r}
+#| label: fetch-data
+#| cache: true
+
+# Generic paginated fetcher
+fetch_paginated <- function(base_url, result_key, limit = 100) {
+  offset   <- 0
+  all_data <- list()
+  repeat {
+    resp <- request(base_url) |>
+      req_url_query(limit = limit, offset = offset, sort = "asc") |>
+      req_perform()
+    parsed   <- resp_body_json(resp, simplifyVector = FALSE)
+    batch    <- parsed[[result_key]]
+    all_data <- c(all_data, batch)
+    if (length(batch) < limit) break
+    offset <- offset + limit
+  }
+  all_data
+}
+
+raw_prizes    <- fetch_paginated("https://api.nobelprize.org/2.1/nobelPrizes", "nobelPrizes")
+raw_laureates <- fetch_paginated("https://api.nobelprize.org/2.1/laureates",   "laureates")
+
+message("Prizes fetched: ",    length(raw_prizes))
+message("Laureates fetched: ", length(raw_laureates))
+```
+
+## Parse into Tidy Data Frames
+
+Claude wrote code to parse data into relevant fields.
+
+```{r}
+#| label: parse-data
+
+# Safe nested field extractor
+get_field <- function(x, keys) {
+  tryCatch({
+    for (k in keys) {
+      if (is.null(x) || !k %in% names(x)) return(NA_character_)
+      x <- x[[k]]
+    }
+    if (is.null(x) || length(x) == 0) NA_character_ else as.character(x[[1]])
+  }, error = function(e) NA_character_)
+}
+
+# --- Prizes data frame (year, category, amounts) ---
+parse_prize <- function(p) {
+  laus <- if (!is.null(p[["laureates"]])) p[["laureates"]] else list()
+  ids  <- vapply(laus, function(l) as.character(l[["id"]] %||% NA), character(1))
+  data.frame(
+    year         = as.integer(p[["awardYear"]]),
+    category     = get_field(p, c("category", "en")),
+    amount       = suppressWarnings(as.numeric(p[["prizeAmount"]])),
+    amount_adj   = suppressWarnings(as.numeric(p[["prizeAmountAdjusted"]])),
+    laureate_ids = paste(ids[!is.na(ids)], collapse = "; "),
+    stringsAsFactors = FALSE
+  )
+}
+
+prizes_df <- as_tibble(do.call(rbind, lapply(raw_prizes, parse_prize))) |>
+  mutate(
+    category = str_to_title(category),
+    category = recode(category,
+      "Economic Sciences" = "Economics",
+      "Physiology Or Medicine" = "Medicine"
+    )
+  )
+
+# --- Laureates data frame (id -> birth country) ---
+parse_laureate <- function(l) {
+  data.frame(
+    laureate_id = as.character(l[["id"]]),
+    country = {
+      # Try birth country paths, then founded (for organisations)
+      val <- get_field(l, c("birth", "place", "countryNow", "en"))
+      if (is.na(val)) val <- get_field(l, c("birth", "place", "country", "en"))
+      if (is.na(val)) val <- get_field(l, c("founded", "place", "countryNow", "en"))
+      if (is.na(val)) val <- get_field(l, c("founded", "place", "country", "en"))
+      val
+    },
+    stringsAsFactors = FALSE
+  )
+}
+
+laureates_df <- as_tibble(do.call(rbind, lapply(raw_laureates, parse_laureate)))
+
+cat("Sample countries from laureates_df:
+")
+print(head(laureates_df, 10))
+```
+
+------------------------------------------------------------------------
+
+## 1. Growth in Prize Amount Over Time
+
+We wanted to know the nominal prize amount (SEK) alongside the inflation-adjusted amount to show growth of prize amounts relative to purchasing power.
+
+```{r}
+#| label: prize-growth
+#| fig-width: 10
+#| fig-height: 5
+
+prize_amounts <- prizes_df |>
+  filter(!is.na(amount)) |>
+  select(year, amount, amount_adj) |>
+  distinct() |>
+  pivot_longer(c(amount, amount_adj),
+               names_to  = "type",
+               values_to = "sek") |>
+  mutate(type = recode(type,
+    "amount"     = "Nominal",
+    "amount_adj" = "Inflation-Adjusted (2023 SEK)"
+  ))
+
+ggplot(prize_amounts, aes(x = year, y = sek / 1e6, color = type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5, alpha = 0.6) +
+  scale_y_continuous(labels = label_number(suffix = "M SEK")) +
+  scale_color_manual(values = c("Nominal" = "#1f78b4",
+                                "Inflation-Adjusted (2023 SEK)" = "#e66101")) +
+  labs(
+    title   = "Nobel Prize Amount Over Time",
+    subtitle = "Nominal vs. inflation-adjusted prize value (SEK)",
+    x = "Year", y = "Prize Amount", color = NULL
+  ) +
+  theme(legend.position = "bottom")
+```
+
+------------------------------------------------------------------------
+
+## 2. Relative Prize Share by Category (Last 10 Years)
+
+We wanted to see if there are any changes to relative spend across categories over the past 10 years...we confirmed no change!
+
+```{r}
+#| label: relative-share
+#| fig-width: 10
+#| fig-height: 6
+
+last10 <- prizes_df |>
+  filter(year >= current_year - 10, !is.na(amount))
+
+share_df <- last10 |>
+  group_by(year) |>
+  mutate(total_year = sum(amount)) |>
+  ungroup() |>
+  mutate(pct = amount / total_year * 100)
+
+ggplot(share_df, aes(x = factor(year), y = pct, fill = category)) +
+  geom_col(position = "fill", width = 0.8) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title    = "Nobel Prize Share by Category",
+    subtitle = paste0("Last 10 years (", current_year - 10, "–", current_year - 1, ")"),
+    x = "Year", y = "% of Total Prize Money", fill = "Category"
+  ) +
+  theme(
+    axis.text.x    = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+```
+
+------------------------------------------------------------------------
+
+## 3. Number of Prizes by Country (Last 10 Years)
+
+We see that USA won the most prizes by far, more than doubling the next most awarded country, UK.
+
+```{r}
+#| label: country-prizes
+#| fig-width: 10
+#| fig-height: 6
+
+# Join prizes to laureates via the laureate_ids column
+prizes_long <- prizes_df |>
+  filter(.data$year >= current_year - 10,
+         nchar(.data$laureate_ids) > 0) |>
+  mutate(laureate_id = strsplit(.data$laureate_ids, "; ")) |>
+  unnest(cols = laureate_id) |>
+  left_join(laureates_df, by = "laureate_id") |>
+  filter(!is.na(country), nchar(country) > 0)
+
+country_prizes <- prizes_long |>
+  count(country, name = "n_prizes") |>
+  arrange(desc(n_prizes))
+
+ggplot(country_prizes, aes(x = reorder(country, n_prizes), y = n_prizes)) +
+  geom_col(fill = "#2166ac", width = 0.75) +
+  geom_text(aes(label = n_prizes), hjust = -0.2, size = 3.2) +
+  coord_flip() +
+  expand_limits(y = max(country_prizes$n_prizes) * 1.12) +
+  labs(
+    title    = "Nobel Prizes by Country",
+    subtitle = paste0("Last 10 years (", current_year - 10, "–", current_year - 1, ")"),
+    x = NULL, y = "Number of Prizes"
+  )
+```
+
+------------------------------------------------------------------------
+
+## 4. Top 5 Countries Over Time (Last 10 Years)
+
+Finally, we broke down the number of prizes won by each of the top 5 countries. We see that even though USA won the most prizes, 2016 seems to be a low year for USA, with the UK winning more prizes than anyone else that year. Furthermore, in seems last year, the number of prizes were evenly split between top countries, this would be an interesting trend to following for 2026.
+
+```{r}
+#| label: top5-countries
+#| fig-width: 10
+#| fig-height: 6
+
+top5 <- country_prizes |>
+  slice_head(n = 5) |>
+  pull(country)
+
+top5_df <- prizes_long |>
+  filter(country %in% top5) |>
+  count(year, country, name = "n_prizes")
+
+ggplot(top5_df, aes(x = year, y = n_prizes, color = country)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = seq(current_year - 10, current_year - 1, by = 1)) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title    = "Top 5 Countries: Nobel Prizes Per Year",
+    subtitle = paste0("Last 10 years (", current_year - 10, "–", current_year - 1, ")"),
+    x = "Year", y = "Number of Prizes", color = "Country"
+  ) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+```
+
+------------------------------------------------------------------------
+
+References:
+
+*Data sourced from the [Nobel Prize API v2.1](https://api.nobelprize.org/2.1/nobelPrizes). Analysis performed in R.*
+
+Claude Sonnet 4.6 (2026) Anthropic LLM. Link to chat: <https://claude.ai/share/a51afbbf-e04f-46ea-b2fe-b3a6ac7e0102>
